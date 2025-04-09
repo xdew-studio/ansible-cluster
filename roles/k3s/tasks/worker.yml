@@ -1,0 +1,60 @@
+---
+- name: Get node token from the first control node
+  ansible.builtin.set_fact:
+    k3s_node_token: "{{ hostvars[groups['master'][0]]['k3s_node_token'] }}"
+
+- name: Get master node IP
+  ansible.builtin.set_fact:
+    master_ip: "10.0.0.10"
+  run_once: true
+
+- name: Check K3s service state on worker nodes
+  ansible.builtin.shell: systemctl is-active k3s-agent || systemctl is-active k3s || echo "not-active"
+  register: k3s_worker_state
+  failed_when: false
+
+- name: Wait if K3s agent is activating
+  ansible.builtin.shell:
+    cmd: systemctl is-active k3s-agent || systemctl is-active k3s || echo "not-active"
+  until: k3s_worker_state.stdout == "activating" and not k3s_worker_state.stdout == "not-active"
+  retries: 20
+  delay: 10
+  register: k3s_worker_final_state
+  when: k3s_worker_state.stdout == "activating"
+
+- name: Reset failed K3s service if it exists but failed
+  ansible.builtin.shell: |
+    if systemctl status k3s-agent >/dev/null 2>&1; then
+      systemctl stop k3s-agent || true
+      systemctl reset-failed k3s-agent || true
+      systemctl disable k3s-agent || true
+    fi
+    if systemctl status k3s >/dev/null 2>&1; then
+      systemctl stop k3s || true
+      systemctl reset-failed k3s || true
+      systemctl disable k3s || true
+    fi
+    [ -f /usr/local/bin/k3s-killall.sh ] && /usr/local/bin/k3s-killall.sh || true
+    [ -f /usr/local/bin/k3s-agent-uninstall.sh ] && /usr/local/bin/k3s-agent-uninstall.sh || true
+  when:
+    - k3s_worker_final_state.stdout is defined and k3s_worker_final_state.stdout == "failed"
+
+- name: Install K3s on worker nodes
+  ansible.builtin.shell: |
+    export INSTALL_K3S_VERSION="{{ k3s_version }}"
+    curl -sfL https://get.k3s.io | K3S_URL=https://{{ master_ip }}:6443 K3S_TOKEN={{ k3s_node_token }} sh -s - agent \
+    --kubelet-arg="max-pods=110"
+  when:
+    - (k3s_worker_final_state.stdout is defined and k3s_worker_final_state.stdout != "active") or
+      (k3s_worker_state.stdout != "active" and k3s_worker_state.stdout != "activating" and k3s_worker_final_state.stdout is not defined)
+  register: k3s_worker_install_result
+  failed_when: k3s_worker_install_result.rc != 0 and "Already installed" not in k3s_worker_install_result.stderr
+
+- name: Wait for worker nodes to be active
+  ansible.builtin.shell:
+    cmd: systemctl is-active k3s-agent || systemctl is-active k3s || echo "not-active"
+  register: k3s_worker_status
+  until: k3s_worker_status.stdout == "active" and not k3s_worker_status.stdout == "not-active"
+  retries: 20
+  delay: 10
+  when: k3s_worker_install_result.changed|default(false)

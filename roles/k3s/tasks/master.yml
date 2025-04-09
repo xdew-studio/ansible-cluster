@@ -1,0 +1,150 @@
+---
+- name: Check if K3s is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+  when: inventory_hostname == groups['master'][0]
+
+- name: Check K3s service state on first control plane node
+  ansible.builtin.shell: systemctl is-active k3s || echo "not-active"
+  register: k3s_service_state
+  when: inventory_hostname == groups['master'][0]
+
+- name: Wait for K3s to finish activating (if in that state)
+  ansible.builtin.shell: |
+    systemctl is-active k3s || echo "not-active"
+  register: k3s_final_state
+  until: k3s_final_state.stdout == "active" and not k3s_final_state.stdout == "not-active"
+  delay: 10
+  retries: 10
+  when:
+    - inventory_hostname == groups['master'][0]
+    - k3s_service_state.stdout == "activating"
+
+- name: Check if K3s is functioning properly
+  ansible.builtin.shell: |
+    kubectl get nodes || echo "cluster-not-ready"
+  register: k3s_cluster_status
+  failed_when: false
+  when:
+    - inventory_hostname == groups['master'][0]
+    - (k3s_final_state.stdout is defined and k3s_final_state.stdout == "active") or
+      (k3s_service_state.stdout == "active" and k3s_final_state.stdout is not defined)
+
+- name: Reset failed K3s service if it exists but is broken
+  ansible.builtin.shell: |
+    systemctl stop k3s || true
+    systemctl reset-failed k3s || true
+    systemctl disable k3s || true
+    [ -f /usr/local/bin/k3s-killall.sh ] && /usr/local/bin/k3s-killall.sh || true
+  when:
+    - inventory_hostname == groups['master'][0]
+    - k3s_binary.stat.exists|default(false)
+    - (k3s_final_state.stdout is defined and k3s_final_state.stdout != "active") or
+      (k3s_service_state.stdout != "active" and k3s_service_state.stdout != "activating" and k3s_final_state.stdout is not defined) or
+      (k3s_cluster_status.rc != 0 and k3s_service_state.stdout == "active")
+
+- name: Deploy first control plane node
+  ansible.builtin.shell: |
+    export INSTALL_K3S_VERSION="{{ k3s_version }}"
+    curl -sfL https://get.k3s.io | sh -s - server \
+    --token="{{ k3s_token }}" \
+    --tls-san="{{ cluster_domain }}" \
+    --cluster-init \
+    --etcd-expose-metrics="true" \
+    --kubelet-arg="max-pods=110" \
+    --kubelet-arg="node-status-update-frequency=4s" \
+    --write-kubeconfig-mode="644"
+  when:
+    - inventory_hostname == groups['master'][0]
+    - (k3s_final_state.stdout is defined and k3s_final_state.stdout != "active") or
+      (k3s_service_state.stdout != "active" and k3s_service_state.stdout != "activating" and k3s_final_state.stdout is not defined) or
+      (k3s_cluster_status.rc != 0 and k3s_service_state.stdout == "active")
+  register: k3s_install_result
+  failed_when: k3s_additional_install_result.rc != 0 and "Job for k3s.service failed" in k3s_additional_install_result.stderr
+
+- name: Wait for K3s service to be active after installation
+  ansible.builtin.shell: |
+    systemctl is-active k3s || echo "not-active"
+  register: k3s_activation_wait
+  until: k3s_activation_wait.stdout == "active" and not k3s_activation_wait.stdout == "not-active"
+  retries: 30
+  delay: 10
+  when:
+    - inventory_hostname == groups['master'][0]
+    - k3s_install_result.changed|default(false)
+
+- name: Wait for first control node to be ready
+  ansible.builtin.wait_for:
+    path: /var/lib/rancher/k3s/server/node-token
+    timeout: 300
+  when: inventory_hostname == groups['master'][0]
+  register: k3s_first_node_ready
+
+- name: Wait for kubectl to be functional
+  ansible.builtin.shell: |
+    kubectl get nodes || echo "cluster-not-ready"
+  register: k3s_cluster_ready
+  until: k3s_cluster_ready.rc == 0 and not k3s_cluster_ready.rc == 1
+  retries: 30
+  delay: 10
+  when:
+    - inventory_hostname == groups['master'][0]
+    - k3s_first_node_ready.elapsed < 300
+
+- name: Get K3s token
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  register: node_token
+  when: inventory_hostname == groups['master'][0]
+
+- name: Store control node token
+  ansible.builtin.set_fact:
+    k3s_node_token: "{{ node_token['content'] | b64decode | trim }}"
+  when: inventory_hostname == groups['master'][0]
+
+- name: Share token with other nodes
+  ansible.builtin.set_fact:
+    k3s_node_token: "{{ hostvars[groups['master'][0]]['k3s_node_token'] }}"
+  when: inventory_hostname != groups['master'][0]
+
+- name: Check K3s service state on additional control plane nodes
+  ansible.builtin.shell: systemctl is-active k3s || echo "not-active"
+  register: k3s_additional_service_state
+  when: inventory_hostname != groups['master'][0] and inventory_hostname in groups['master']
+
+- name: Deploy additional control plane nodes
+  ansible.builtin.shell: |
+    export INSTALL_K3S_VERSION="{{ k3s_version }}"
+    curl -sfL https://get.k3s.io | sh -s - server \
+    --token="{{ k3s_node_token }}" \
+    --tls-san="{{ cluster_domain }}" \
+    --server="https://10.0.0.10:6443" \
+    --etcd-expose-metrics="true" \
+    --kubelet-arg="max-pods=110" \
+    --kubelet-arg="node-status-update-frequency=4s" \
+    --write-kubeconfig-mode="644"
+  when:
+    - inventory_hostname != groups['master'][0]
+    - inventory_hostname in groups['master']
+    - k3s_additional_service_state.stdout != "active"
+  register: k3s_additional_install_result
+  failed_when: k3s_additional_install_result.rc != 0 and "Job for k3s.service failed" in k3s_additional_install_result.stderr
+  changed_when: k3s_additional_install_result.rc == 0 or "Node password already set" in k3s_additional_install_result.stderr
+
+- name: Wait for additional control plane nodes to be active
+  ansible.builtin.shell: |
+    systemctl is-active k3s || echo "not-active"
+  register: k3s_additional_activation_wait
+  until: k3s_additional_activation_wait.stdout == "active" and not k3s_additional_activation_wait.stdout == "not-active"
+  retries: 30
+  delay: 10
+  when:
+    - inventory_hostname != groups['master'][0]
+    - inventory_hostname in groups['master']
+    - k3s_additional_install_result.changed|default(false)
+
+- name: Export node token for workers
+  ansible.builtin.set_fact:
+    k3s_node_token: "{{ hostvars[groups['master'][0]]['k3s_node_token'] }}"
+  when: inventory_hostname == groups['master'][0]

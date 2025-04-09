@@ -1,0 +1,8 @@
+---
+- name: Deploy K3s to control plane nodes
+  ansible.builtin.include_tasks: master.yml
+  when: inventory_hostname in groups['master']
+
+- name: Deploy K3s to worker nodes
+  ansible.builtin.include_tasks: worker.yml
+  when: inventory_hostname in groups['worker']
